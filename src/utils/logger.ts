@@ -208,7 +208,7 @@ export const logger = {
 ║   ╚═════╝ ╚══════╝  ╚═══╝      ╚══════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝║
 ║                                                               ║
 ║             Oracle Extractable Value Searcher                 ║
-║                  Morpho Blue on Base                          ║
+║                Morpho Blue on Ethereum                        ║
 ║                                                               ║
 ╚═══════════════════════════════════════════════════════════════╝
     `));

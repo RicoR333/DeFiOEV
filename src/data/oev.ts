@@ -2,7 +2,7 @@
  * API3 OEV Network Integration
  *
  * This module integrates with API3's OEV (Oracle Extractable Value) Network
- * to check auction status and identify OEV-enabled markets.
+ * to check auction status and identify OEV-enabled markets on Ethereum mainnet.
  *
  * WHAT IS THE OEV NETWORK?
  * The OEV Network is an Arbitrum Nitro L2 (Chain ID: 4913) that hosts
@@ -25,10 +25,11 @@
  * - OEV Network Docs: https://docs.api3.org/oev-searchers/in-depth/oev-network/
  * - Example Bot: https://github.com/api3dao/oev-orbit-bot-example
  * - OEV Bridge: https://oev.bridge.api3.org/
+ * - OEV-Boosted Markets: https://blog.api3.org/introducing-oev-boosted-morpho-markets/
  */
 
 import { createPublicClient, http, parseAbi, type Address } from 'viem';
-import { base } from 'viem/chains';
+import { mainnet } from 'viem/chains';
 import logger from '../utils/logger';
 
 // =============================================================================
@@ -43,24 +44,47 @@ export const OEV_NETWORK_RPC = 'https://oev.rpc.api3.org/http';
 // This is where bids are placed and auctions are managed
 export const OEV_AUCTION_HOUSE_ADDRESS = '0x34f13A5C0AD750d212267bcBc230c87AEFD35CC5' as const;
 
-// Base chain configuration
-const BASE_RPC_URL = process.env.BASE_RPC_URL || 'https://mainnet.base.org';
+// Ethereum mainnet configuration
+const ETH_RPC_URL = process.env.ETH_RPC_URL || 'https://eth.llamarpc.com';
 
 // =============================================================================
-// KNOWN API3 ORACLE ADDRESSES ON BASE
+// OEV-BOOSTED USDC VAULT
 // =============================================================================
 
 /**
- * Known API3 dAPI proxy addresses on Base
+ * OEV-Boosted USDC Vault on Ethereum
+ *
+ * This vault is curated by Yearn and allocates exclusively to markets
+ * secured by API3 oracles, enabling OEV capture.
+ *
+ * Reference: https://blog.api3.org/introducing-oev-boosted-morpho-markets/
+ */
+export const OEV_BOOSTED_USDC_VAULT = {
+  address: '0x68Aea7b82Df6CcdF76235D46445Ed83f85F845A3' as const,
+  name: 'OEV-Boosted USDC Vault',
+  curator: 'Yearn Finance',
+  asset: 'USDC',
+  description: 'Curated vault that allocates to OEV-enabled Morpho markets with API3 oracles',
+  // Markets this vault allocates to
+  allocatedMarkets: [
+    '0x6d2fba32b8649d92432d036c16aa80779034b7469b63abc259b17678857f31c2', // wstETH/USDC
+    '0x64d65c9a2d91c36d56fbc42d69e979335320169b3df63bf92789e2c8883fcc64', // cbBTC/USDC
+  ],
+};
+
+// =============================================================================
+// KNOWN API3 ORACLE ADDRESSES ON ETHEREUM
+// =============================================================================
+
+/**
+ * Known API3 dAPI proxy addresses on Ethereum mainnet
  *
  * API3 uses a proxy pattern for their oracles. These addresses are the
  * Api3ReaderProxyV1 contracts that dApps read from.
  *
- * To find more: https://market.api3.org (select Base chain)
- *
- * Format: Oracle Address -> { name, basePair, quotePair }
+ * To find more: https://market.api3.org (select Ethereum)
  */
-export const API3_ORACLES_BASE: Record<string, {
+export const API3_ORACLES_ETHEREUM: Record<string, {
   name: string;
   basePair: string;
   quotePair: string;
@@ -73,7 +97,7 @@ export const API3_ORACLES_BASE: Record<string, {
     quotePair: 'USD',
     description: 'Ethereum price in USD',
   },
-  // wstETH/USD (often combined from wstETH/ETH + ETH/USD)
+  // wstETH/ETH exchange rate
   '0x724195e37881a930e618fb0f70e5cce6a0e83dc6': {
     name: 'wstETH/ETH',
     basePair: 'wstETH',
@@ -94,24 +118,32 @@ export const API3_ORACLES_BASE: Record<string, {
     quotePair: 'USD',
     description: 'Bitcoin price in USD',
   },
-  // cbBTC/USD
+  // cbBTC/BTC
   '0xe67e80ed8b0def2bc572d9d4864124201b30d4e2': {
-    name: 'cbBTC/USD',
+    name: 'cbBTC/BTC',
     basePair: 'cbBTC',
-    quotePair: 'USD',
-    description: 'Coinbase wrapped BTC price',
+    quotePair: 'BTC',
+    description: 'Coinbase wrapped BTC exchange rate',
   },
 };
 
+// =============================================================================
+// OEV-ENABLED MORPHO MARKETS ON ETHEREUM
+// =============================================================================
+
 /**
- * Known Morpho Blue markets on Base that use API3 oracles
+ * Known Morpho Blue markets on Ethereum that use API3 oracles
  *
  * These are the OEV-enabled markets where we can capture liquidation value
  * through the API3 OEV Network auctions.
  *
  * Market ID is the keccak256 hash of (loanToken, collateralToken, oracle, irm, lltv)
+ *
+ * References:
+ * - wstETH/USDC: https://app.morpho.org/ethereum/market/0x6d2fba32b8649d92432d036c16aa80779034b7469b63abc259b17678857f31c2/wsteth-usdc
+ * - cbBTC/USDC: https://app.morpho.org/ethereum/market/0x64d65c9a2d91c36d56fbc42d69e979335320169b3df63bf92789e2c8883fcc64/cbbtc-usdc
  */
-export const API3_MORPHO_MARKETS_BASE: Record<string, {
+export const API3_MORPHO_MARKETS_ETHEREUM: Record<string, {
   name: string;
   collateralToken: string;
   collateralSymbol: string;
@@ -120,38 +152,36 @@ export const API3_MORPHO_MARKETS_BASE: Record<string, {
   oracle: string;
   lltv: string;
   isOevEnabled: boolean;
+  morphoUrl: string;
 }> = {
-  // wstETH/USDC market - The flagship OEV-boosted market
-  // Reference: https://blog.api3.org/introducing-oev-boosted-morpho-markets/
-  '0xa066f3893b780833699043f824e5bb88b8df039886f524f62b9a1ac83cb7f1f0': {
+  // wstETH/USDC market - Primary OEV-boosted market
+  '0x6d2fba32b8649d92432d036c16aa80779034b7469b63abc259b17678857f31c2': {
     name: 'wstETH/USDC',
-    collateralToken: '0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452',
+    collateralToken: '0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0', // wstETH on Ethereum
     collateralSymbol: 'wstETH',
-    loanToken: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+    loanToken: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', // USDC on Ethereum
     loanSymbol: 'USDC',
-    oracle: '0x', // Morpho oracle adapter (wraps API3 feed)
+    oracle: '0x', // API3-powered oracle adapter
     lltv: '860000000000000000', // 86%
     isOevEnabled: true,
+    morphoUrl: 'https://app.morpho.org/ethereum/market/0x6d2fba32b8649d92432d036c16aa80779034b7469b63abc259b17678857f31c2/wsteth-usdc',
   },
-  // cbBTC/USDC market
-  '0x': {
+  // cbBTC/USDC market - OEV-boosted market
+  '0x64d65c9a2d91c36d56fbc42d69e979335320169b3df63bf92789e2c8883fcc64': {
     name: 'cbBTC/USDC',
-    collateralToken: '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf',
+    collateralToken: '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf', // cbBTC on Ethereum
     collateralSymbol: 'cbBTC',
-    loanToken: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+    loanToken: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', // USDC on Ethereum
     loanSymbol: 'USDC',
-    oracle: '0x',
-    lltv: '800000000000000000', // 80%
+    oracle: '0x', // API3-powered oracle adapter
+    lltv: '860000000000000000', // 86%
     isOevEnabled: true,
+    morphoUrl: 'https://app.morpho.org/ethereum/market/0x64d65c9a2d91c36d56fbc42d69e979335320169b3df63bf92789e2c8883fcc64/cbbtc-usdc',
   },
 };
 
-// List of known API3 oracle contract patterns on Base
-// API3 oracles often follow certain deployment patterns
-const API3_ORACLE_PATTERNS = [
-  /^0x5b0cf2b36a65a6bb085d501b971e4c102b9cd473/i, // Known ETH/USD
-  /^0x724195e37881a930e618fb0f70e5cce6a0e83dc6/i, // Known wstETH
-];
+// Alias for backward compatibility
+export const API3_MORPHO_MARKETS_BASE = API3_MORPHO_MARKETS_ETHEREUM;
 
 // =============================================================================
 // TYPES
@@ -184,14 +214,13 @@ export interface OevMarketInfo {
 // VIEM CLIENTS
 // =============================================================================
 
-// Base chain client for reading oracle data
-const baseClient = createPublicClient({
-  chain: base,
-  transport: http(BASE_RPC_URL),
+// Ethereum mainnet client for reading oracle data
+const ethClient = createPublicClient({
+  chain: mainnet,
+  transport: http(ETH_RPC_URL),
 });
 
 // OEV Network client (when available)
-// Note: This requires bridging ETH to OEV Network first
 let oevNetworkClient: ReturnType<typeof createPublicClient> | null = null;
 
 try {
@@ -219,29 +248,19 @@ const OEV_AUCTION_HOUSE_ABI = parseAbi([
   'function bidderToBalance(address bidder) external view returns (uint256)',
 ]);
 
-// Morpho Oracle interface to check oracle type
-const MORPHO_ORACLE_ABI = parseAbi([
-  'function price() external view returns (uint256)',
-  'function PRICE_SCALE() external view returns (uint256)',
-]);
-
 // =============================================================================
 // ORACLE DETECTION
 // =============================================================================
 
 /**
  * Check if an oracle address is an API3 oracle
- *
- * API3 oracles have a specific interface (Api3ReaderProxyV1) with:
- * - read() function returning (int224 value, uint32 timestamp)
- * - api3ServerV1() function returning the server address
  */
 export async function isApi3Oracle(oracleAddress: string): Promise<Api3OracleInfo> {
   const normalizedAddress = oracleAddress.toLowerCase();
 
   // Check known API3 oracles first
-  if (API3_ORACLES_BASE[normalizedAddress]) {
-    const oracleInfo = API3_ORACLES_BASE[normalizedAddress];
+  if (API3_ORACLES_ETHEREUM[normalizedAddress]) {
+    const oracleInfo = API3_ORACLES_ETHEREUM[normalizedAddress];
     return {
       isApi3Oracle: true,
       oracleName: oracleInfo.name,
@@ -250,27 +269,14 @@ export async function isApi3Oracle(oracleAddress: string): Promise<Api3OracleInf
     };
   }
 
-  // Check if it matches known patterns
-  for (const pattern of API3_ORACLE_PATTERNS) {
-    if (pattern.test(normalizedAddress)) {
-      return {
-        isApi3Oracle: true,
-        oracleName: 'Unknown API3 Feed',
-        oevEnabled: true,
-        proxyAddress: oracleAddress,
-      };
-    }
-  }
-
   // Try to detect by calling the API3 interface
   try {
-    const result = await baseClient.readContract({
+    const result = await ethClient.readContract({
       address: oracleAddress as Address,
       abi: API3_READER_PROXY_ABI,
       functionName: 'api3ServerV1',
     });
 
-    // If this call succeeds, it's likely an API3 oracle
     if (result) {
       return {
         isApi3Oracle: true,
@@ -299,7 +305,7 @@ export async function checkMarketOracleType(
   oracleAddress: string
 ): Promise<OevMarketInfo> {
   // Check if it's a known API3 Morpho market
-  const knownMarket = API3_MORPHO_MARKETS_BASE[marketId.toLowerCase()];
+  const knownMarket = API3_MORPHO_MARKETS_ETHEREUM[marketId.toLowerCase()];
   if (knownMarket) {
     return {
       marketId,
@@ -311,7 +317,7 @@ export async function checkMarketOracleType(
         oevEnabled: knownMarket.isOevEnabled,
         proxyAddress: oracleAddress,
       },
-      auctionStatus: null, // Would need to fetch from OEV Network
+      auctionStatus: null,
     };
   }
 
@@ -333,40 +339,28 @@ export async function checkMarketOracleType(
 
 /**
  * Generate a bid topic for an OEV auction
- *
- * The bid topic identifies the specific auction for a dApp/data feed combination.
- * Format: keccak256(abi.encode(dappId, dataFeedId))
  */
 export function generateBidTopic(dappId: string, dataFeedId: string): string {
-  // In production, this would use proper encoding
-  // For now, return a placeholder
   return `0x${Buffer.from(`${dappId}:${dataFeedId}`).toString('hex').padEnd(64, '0')}`;
 }
 
 /**
  * Check the status of an OEV auction (placeholder)
- *
- * In a full implementation, this would:
- * 1. Connect to OEV Network
- * 2. Query OevAuctionHouse contract
- * 3. Return current auction state
  */
 export async function getAuctionStatus(
   bidTopic: string
 ): Promise<OevAuctionStatus | null> {
-  // Check if OEV Network client is available
   if (!oevNetworkClient) {
     logger.debug('OEV Network client not available, cannot fetch auction status');
     return null;
   }
 
   try {
-    // This is a simplified check - real implementation would query the auction house
     return {
-      isActive: true, // Auctions are generally always active for enabled markets
+      isActive: true,
       currentBid: 0n,
       currentBidder: null,
-      expirationTimestamp: Math.floor(Date.now() / 1000) + 60, // 1 minute from now
+      expirationTimestamp: Math.floor(Date.now() / 1000) + 60,
       bidTopic,
     };
   } catch (error) {
@@ -377,14 +371,11 @@ export async function getAuctionStatus(
 
 /**
  * Estimate the optimal bid amount for a liquidation opportunity
- *
- * The bid should be less than the expected profit to ensure profitability.
- * Typical strategy: bid 50-80% of expected profit
  */
 export function estimateOptimalBid(
   expectedProfit: number,
-  gasEstimate: number = 50, // USD
-  bidAggressiveness: number = 0.6 // 60% of profit
+  gasEstimate: number = 50,
+  bidAggressiveness: number = 0.6
 ): { bidAmount: number; netProfit: number } {
   const maxBid = expectedProfit * bidAggressiveness;
   const bidAmount = Math.max(0, maxBid - gasEstimate);
@@ -417,7 +408,7 @@ export function filterApi3Positions<T extends { marketId: string }>(
  */
 export function getKnownApi3MarketIds(): Set<string> {
   return new Set(
-    Object.keys(API3_MORPHO_MARKETS_BASE).map((id) => id.toLowerCase())
+    Object.keys(API3_MORPHO_MARKETS_ETHEREUM).map((id) => id.toLowerCase())
   );
 }
 
@@ -425,8 +416,15 @@ export function getKnownApi3MarketIds(): Set<string> {
  * Check if a market is OEV-enabled
  */
 export function isOevEnabledMarket(marketId: string): boolean {
-  const market = API3_MORPHO_MARKETS_BASE[marketId.toLowerCase()];
+  const market = API3_MORPHO_MARKETS_ETHEREUM[marketId.toLowerCase()];
   return market?.isOevEnabled ?? false;
+}
+
+/**
+ * Get market info by ID
+ */
+export function getMarketInfo(marketId: string) {
+  return API3_MORPHO_MARKETS_ETHEREUM[marketId.toLowerCase()] || null;
 }
 
 // =============================================================================
@@ -461,12 +459,19 @@ export function formatOevInfo(marketInfo: OevMarketInfo): string {
  * Get summary of OEV-enabled markets
  */
 export function getOevMarketsSummary(): string {
-  const markets = Object.entries(API3_MORPHO_MARKETS_BASE)
+  const markets = Object.entries(API3_MORPHO_MARKETS_ETHEREUM)
     .filter(([_, info]) => info.isOevEnabled)
     .map(([id, info]) => `  • ${info.name} (${id.slice(0, 10)}...)`)
     .join('\n');
 
-  return `Known OEV-Enabled Markets on Base:\n${markets}`;
+  return `Known OEV-Enabled Markets on Ethereum:\n${markets}`;
+}
+
+/**
+ * Get vault info
+ */
+export function getVaultInfo() {
+  return OEV_BOOSTED_USDC_VAULT;
 }
 
 // =============================================================================
@@ -478,8 +483,9 @@ export default {
   OEV_NETWORK_CHAIN_ID,
   OEV_NETWORK_RPC,
   OEV_AUCTION_HOUSE_ADDRESS,
-  API3_ORACLES_BASE,
-  API3_MORPHO_MARKETS_BASE,
+  OEV_BOOSTED_USDC_VAULT,
+  API3_ORACLES_ETHEREUM,
+  API3_MORPHO_MARKETS_ETHEREUM,
 
   // Detection
   isApi3Oracle,
@@ -494,8 +500,10 @@ export default {
   filterApi3Positions,
   getKnownApi3MarketIds,
   isOevEnabledMarket,
+  getMarketInfo,
 
   // Utilities
   formatOevInfo,
   getOevMarketsSummary,
+  getVaultInfo,
 };

@@ -1,7 +1,7 @@
 /**
  * Morpho Blue Data Fetcher
  *
- * This module fetches lending position data from Morpho Blue on Base using:
+ * This module fetches lending position data from Morpho Blue on Ethereum using:
  * 1. Morpho's Official API (primary) - https://blue-api.morpho.org/graphql
  * 2. On-chain data via viem (fallback) - Direct contract reads
  *
@@ -18,11 +18,14 @@
  * When a position's health factor drops below 1.0, it becomes liquidatable.
  * Liquidators can repay the debt and receive the collateral at a discount.
  * The "bonus" or discount is typically 5-15% depending on the protocol.
+ *
+ * NOTE: OEV-enabled markets (with API3 oracles) are on Ethereum mainnet,
+ * not Base. This module targets Ethereum for OEV opportunities.
  */
 
 import { GraphQLClient, gql } from 'graphql-request';
 import { createPublicClient, http, formatUnits, parseAbi } from 'viem';
-import { base } from 'viem/chains';
+import { mainnet } from 'viem/chains';
 import logger from '../utils/logger';
 
 // =============================================================================
@@ -32,22 +35,22 @@ import logger from '../utils/logger';
 // Morpho's Official GraphQL API endpoint
 const MORPHO_API_URL = 'https://blue-api.morpho.org/graphql';
 
-// Base chain ID for filtering
-const BASE_CHAIN_ID = 8453;
+// Ethereum mainnet chain ID for OEV-enabled markets
+export const ETHEREUM_CHAIN_ID = 1;
 
-// Morpho Blue contract address on Base
+// Morpho Blue contract address (same on Ethereum and Base)
 const MORPHO_BLUE_ADDRESS = '0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb' as const;
 
-// Base RPC endpoint (public)
-const BASE_RPC_URL = process.env.BASE_RPC_URL || 'https://mainnet.base.org';
+// Ethereum RPC endpoint (public)
+const ETH_RPC_URL = process.env.ETH_RPC_URL || 'https://eth.llamarpc.com';
 
 // Initialize GraphQL client for Morpho API
 const graphqlClient = new GraphQLClient(MORPHO_API_URL);
 
 // Initialize viem client for on-chain reads
 const viemClient = createPublicClient({
-  chain: base,
-  transport: http(BASE_RPC_URL),
+  chain: mainnet,
+  transport: http(ETH_RPC_URL),
 });
 
 // =============================================================================
@@ -222,7 +225,7 @@ const POSITIONS_QUERY = gql`
  * Fetch markets from Morpho's official API
  */
 export async function fetchMarketsFromAPI(limit: number = 50): Promise<MorphoMarket[]> {
-  logger.debug(`Fetching markets from Morpho API (chainId: ${BASE_CHAIN_ID})...`);
+  logger.debug(`Fetching markets from Morpho API (chainId: ${ETHEREUM_CHAIN_ID})...`);
 
   try {
     interface MarketsResponse {
@@ -233,7 +236,7 @@ export async function fetchMarketsFromAPI(limit: number = 50): Promise<MorphoMar
 
     const response = await graphqlClient.request<MarketsResponse>(
       MARKETS_QUERY,
-      { chainId: BASE_CHAIN_ID, first: limit }
+      { chainId: ETHEREUM_CHAIN_ID, first: limit }
     );
 
     const markets = response.markets?.items || [];
@@ -275,7 +278,7 @@ export async function fetchPositionsFromAPI(
 
     const response = await graphqlClient.request<PositionsResponse>(
       POSITIONS_QUERY,
-      { chainId: BASE_CHAIN_ID, first, skip }
+      { chainId: ETHEREUM_CHAIN_ID, first, skip }
     );
 
     const rawPositions = response.marketPositions?.items || [];
@@ -527,5 +530,5 @@ export default {
   fetchTokenInfo,
   // Constants
   MORPHO_BLUE_ADDRESS,
-  BASE_CHAIN_ID,
+  ETHEREUM_CHAIN_ID,
 };

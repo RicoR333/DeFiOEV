@@ -46,13 +46,15 @@ import {
 } from './agent/analyzer';
 import { getTracker, PaperTradingTracker } from './agent/tracker';
 import {
-  API3_MORPHO_MARKETS_BASE,
+  API3_MORPHO_MARKETS_ETHEREUM,
+  OEV_BOOSTED_USDC_VAULT,
   getKnownApi3MarketIds,
   isOevEnabledMarket,
   estimateOptimalBid,
   getOevMarketsSummary,
   OEV_NETWORK_CHAIN_ID,
 } from './data/oev';
+import { ETHEREUM_CHAIN_ID } from './data/morpho';
 
 // =============================================================================
 // CONFIGURATION
@@ -331,6 +333,7 @@ function displayStartupInfo(config: SearcherConfig): void {
 
   console.log('\n📋 OEV SEARCHER CONFIGURATION');
   logger.separator('─', 50);
+  console.log(`  Network:           Ethereum Mainnet (Chain ${ETHEREUM_CHAIN_ID})`);
   console.log(`  Mode:              ${config.oevOnly ? 'OEV-Only (API3 markets)' : 'All Markets'}`);
   console.log(`  Scan Interval:     ${config.scanIntervalMs / 1000}s`);
   console.log(`  Max Positions:     ${config.maxPositions}`);
@@ -340,11 +343,18 @@ function displayStartupInfo(config: SearcherConfig): void {
   console.log(`  Continuous Mode:   ${config.continuousMode ? 'Yes' : 'No'}`);
   logger.separator('─', 50);
 
+  // Show OEV-Boosted Vault info
+  console.log('\n🏦 OEV-BOOSTED USDC VAULT:');
+  console.log(`  Address:    ${OEV_BOOSTED_USDC_VAULT.address}`);
+  console.log(`  Curator:    ${OEV_BOOSTED_USDC_VAULT.curator}`);
+  console.log(`  Asset:      ${OEV_BOOSTED_USDC_VAULT.asset}`);
+
   // Show known OEV markets
   console.log('\n🎯 TARGET OEV MARKETS (API3 Oracle):');
-  Object.entries(API3_MORPHO_MARKETS_BASE).forEach(([id, market]) => {
+  Object.entries(API3_MORPHO_MARKETS_ETHEREUM).forEach(([id, market]) => {
     if (market.isOevEnabled) {
       console.log(`  ✓ ${market.name} (LLTV: ${(parseInt(market.lltv) / 1e16).toFixed(0)}%)`);
+      console.log(`    ${market.morphoUrl}`);
     }
   });
 
