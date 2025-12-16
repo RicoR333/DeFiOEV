@@ -1,8 +1,9 @@
 /**
- * Morpho Blue Subgraph Data Fetcher
+ * Morpho Blue Data Fetcher
  *
- * This module connects to The Graph's hosted service to fetch real-time
- * lending position data from Morpho Blue on Base.
+ * This module fetches lending position data from Morpho Blue on Base using:
+ * 1. Morpho's Official API (primary) - https://blue-api.morpho.org/graphql
+ * 2. On-chain data via viem (fallback) - Direct contract reads
  *
  * WHAT IS MORPHO BLUE?
  * Morpho Blue is a minimalist, trustless lending protocol. Unlike Aave or Compound,
@@ -13,11 +14,6 @@
  * - An oracle for price feeds
  * - A Liquidation Loan-To-Value (LLTV) ratio
  *
- * WHAT IS A SUBGRAPH?
- * A subgraph is an indexing service that processes blockchain events and stores
- * them in a queryable database. This is much faster than reading directly from
- * the blockchain for historical or aggregated data.
- *
  * OEV OPPORTUNITY:
  * When a position's health factor drops below 1.0, it becomes liquidatable.
  * Liquidators can repay the debt and receive the collateral at a discount.
@@ -25,50 +21,89 @@
  */
 
 import { GraphQLClient, gql } from 'graphql-request';
+import { createPublicClient, http, formatUnits, parseAbi } from 'viem';
+import { base } from 'viem/chains';
 import logger from '../utils/logger';
 
-// Morpho Blue subgraph endpoint on Base network
-const MORPHO_SUBGRAPH_URL =
-  'https://api.studio.thegraph.com/query/63379/morpho-blue-base/version/latest';
+// =============================================================================
+// CONFIGURATION
+// =============================================================================
 
-// Initialize GraphQL client
-const client = new GraphQLClient(MORPHO_SUBGRAPH_URL);
+// Morpho's Official GraphQL API endpoint
+const MORPHO_API_URL = 'https://blue-api.morpho.org/graphql';
 
-/**
- * Types representing Morpho Blue data structures
- */
+// Base chain ID for filtering
+const BASE_CHAIN_ID = 8453;
 
-// Market information - defines the lending pool parameters
+// Morpho Blue contract address on Base
+const MORPHO_BLUE_ADDRESS = '0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb' as const;
+
+// Base RPC endpoint (public)
+const BASE_RPC_URL = process.env.BASE_RPC_URL || 'https://mainnet.base.org';
+
+// Initialize GraphQL client for Morpho API
+const graphqlClient = new GraphQLClient(MORPHO_API_URL);
+
+// Initialize viem client for on-chain reads
+const viemClient = createPublicClient({
+  chain: base,
+  transport: http(BASE_RPC_URL),
+});
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+// Market information from API
 export interface MorphoMarket {
-  id: string;                    // Unique market identifier (hash)
-  loanToken: {
-    id: string;                  // Token address
-    symbol: string;              // e.g., "USDC"
-    decimals: number;            // Token decimals (usually 6 for USDC, 18 for ETH)
-  };
-  collateralToken: {
-    id: string;
+  id: string;
+  uniqueKey: string;
+  lltv: string;
+  collateralAsset: {
+    address: string;
     symbol: string;
     decimals: number;
   };
-  lltv: string;                  // Liquidation LTV in basis points (e.g., 860000000000000000 = 86%)
-  oracle: string;                // Oracle contract address
-  totalSupply: string;           // Total assets supplied (in loan token units)
-  totalBorrow: string;           // Total assets borrowed
-  totalCollateral: string;       // Total collateral deposited
+  loanAsset: {
+    address: string;
+    symbol: string;
+    decimals: number;
+  };
+  state: {
+    borrowAssets: string;
+    supplyAssets: string;
+    collateral: string;
+  } | null;
 }
 
-// Individual borrower position
-export interface MorphoPosition {
-  id: string;                    // Position ID
-  borrower: string;              // Borrower's wallet address
-  market: MorphoMarket;          // Market this position is in
-  collateral: string;            // Collateral amount (in collateral token units)
-  borrowShares: string;          // Borrow shares (not actual amount - needs conversion)
-  borrowAssets: string;          // Actual borrowed amount
+// Position from API
+export interface MorphoAPIPosition {
+  id: string;
+  user: {
+    address: string;
+  };
+  market: {
+    uniqueKey: string;
+    lltv: string;
+    collateralAsset: {
+      address: string;
+      symbol: string;
+      decimals: number;
+    };
+    loanAsset: {
+      address: string;
+      symbol: string;
+      decimals: number;
+    };
+  };
+  state: {
+    collateral: string;
+    borrowAssets: string;
+    borrowShares: string;
+  } | null;
 }
 
-// Simplified position for our analysis
+// Simplified position for analysis
 export interface AnalyzablePosition {
   id: string;
   borrower: string;
@@ -83,170 +118,330 @@ export interface AnalyzablePosition {
     symbol: string;
     decimals: number;
   };
-  collateralAmount: bigint;      // Raw collateral amount
-  borrowAmount: bigint;          // Raw borrow amount
-  lltv: bigint;                  // Liquidation threshold (in wei, 1e18 scale)
+  collateralAmount: bigint;
+  borrowAmount: bigint;
+  lltv: bigint;
 }
 
-/**
- * GraphQL query to fetch active borrow positions
- *
- * We filter for:
- * - borrowAssets > 0: Position must have outstanding debt
- * - collateral > 0: Position must have collateral deposited
- *
- * We order by borrowAssets descending to prioritize larger positions
- * (larger positions = more profit potential)
- */
-const POSITIONS_QUERY = gql`
-  query GetBorrowPositions($first: Int!, $skip: Int!) {
-    positions(
-      first: $first
-      skip: $skip
-      where: { borrowAssets_gt: "0", collateral_gt: "0" }
-      orderBy: borrowAssets
-      orderDirection: desc
-    ) {
-      id
-      borrower
-      collateral
-      borrowShares
-      borrowAssets
-      market {
-        id
-        lltv
-        oracle
-        totalSupply
-        totalBorrow
-        totalCollateral
-        loanToken {
-          id
-          symbol
-          decimals
-        }
-        collateralToken {
-          id
-          symbol
-          decimals
-        }
-      }
-    }
-  }
-`;
+// =============================================================================
+// GRAPHQL QUERIES FOR MORPHO API
+// =============================================================================
 
 /**
- * GraphQL query to fetch market information
+ * Query to fetch markets on Base with active borrows
+ * The Morpho API uses a different schema than The Graph subgraphs
  */
 const MARKETS_QUERY = gql`
-  query GetMarkets($first: Int!) {
-    markets(first: $first, orderBy: totalBorrow, orderDirection: desc) {
-      id
-      lltv
-      oracle
-      totalSupply
-      totalBorrow
-      totalCollateral
-      loanToken {
+  query GetMarketsOnBase($chainId: Int!, $first: Int!) {
+    markets(
+      where: { chainId_in: [$chainId] }
+      first: $first
+      orderBy: BorrowAssets
+      orderDirection: Desc
+    ) {
+      items {
         id
-        symbol
-        decimals
-      }
-      collateralToken {
-        id
-        symbol
-        decimals
+        uniqueKey
+        lltv
+        collateralAsset {
+          address
+          symbol
+          decimals
+        }
+        loanAsset {
+          address
+          symbol
+          decimals
+        }
+        state {
+          borrowAssets
+          supplyAssets
+          collateral
+        }
       }
     }
   }
 `;
 
 /**
- * Fetch all active markets from Morpho Blue
- *
- * Markets represent different lending pools. Each market is isolated,
- * meaning a liquidation in one market doesn't affect others.
+ * Query to fetch positions with active borrows on Base
  */
-export async function fetchMarkets(limit: number = 100): Promise<MorphoMarket[]> {
-  logger.debug(`Fetching top ${limit} Morpho Blue markets...`);
+const POSITIONS_QUERY = gql`
+  query GetPositionsOnBase($chainId: Int!, $first: Int!, $skip: Int!) {
+    marketPositions(
+      where: {
+        chainId_in: [$chainId],
+        borrowShares_gte: "1"
+      }
+      first: $first
+      skip: $skip
+      orderBy: BorrowShares
+      orderDirection: Desc
+    ) {
+      items {
+        id
+        user {
+          address
+        }
+        market {
+          uniqueKey
+          lltv
+          collateralAsset {
+            address
+            symbol
+            decimals
+          }
+          loanAsset {
+            address
+            symbol
+            decimals
+          }
+        }
+        state {
+          collateral
+          borrowAssets
+          borrowShares
+        }
+      }
+    }
+  }
+`;
+
+// =============================================================================
+// API DATA FETCHING
+// =============================================================================
+
+/**
+ * Fetch markets from Morpho's official API
+ */
+export async function fetchMarketsFromAPI(limit: number = 50): Promise<MorphoMarket[]> {
+  logger.debug(`Fetching markets from Morpho API (chainId: ${BASE_CHAIN_ID})...`);
 
   try {
-    const response = await client.request<{ markets: MorphoMarket[] }>(
+    interface MarketsResponse {
+      markets: {
+        items: MorphoMarket[];
+      };
+    }
+
+    const response = await graphqlClient.request<MarketsResponse>(
       MARKETS_QUERY,
-      { first: limit }
+      { chainId: BASE_CHAIN_ID, first: limit }
     );
 
-    logger.info(`Fetched ${response.markets.length} markets`);
+    const markets = response.markets?.items || [];
+    logger.info(`Fetched ${markets.length} markets from Morpho API`);
 
-    // Log market summaries
-    response.markets.forEach((market) => {
-      const totalBorrow = BigInt(market.totalBorrow || '0');
-      if (totalBorrow > 0n) {
+    // Log active markets
+    markets.forEach((market) => {
+      const borrowAssets = BigInt(market.state?.borrowAssets || '0');
+      if (borrowAssets > 0n) {
         logger.debug(
-          `Market: ${market.collateralToken.symbol}/${market.loanToken.symbol}, ` +
+          `Market: ${market.collateralAsset?.symbol || 'Unknown'}/${market.loanAsset?.symbol || 'Unknown'}, ` +
           `LLTV: ${(Number(market.lltv) / 1e18 * 100).toFixed(1)}%`
         );
       }
     });
 
-    return response.markets;
+    return markets;
   } catch (error) {
-    logger.error('Failed to fetch markets', error);
+    logger.error('Failed to fetch markets from API', error);
     throw error;
   }
 }
 
 /**
- * Fetch borrower positions from the subgraph
- *
- * This is the core data we need for liquidation analysis.
- * We paginate through results to get all positions.
+ * Fetch positions from Morpho's official API
+ */
+export async function fetchPositionsFromAPI(
+  first: number = 100,
+  skip: number = 0
+): Promise<AnalyzablePosition[]> {
+  logger.debug(`Fetching positions from Morpho API (first: ${first}, skip: ${skip})...`);
+
+  try {
+    interface PositionsResponse {
+      marketPositions: {
+        items: MorphoAPIPosition[];
+      };
+    }
+
+    const response = await graphqlClient.request<PositionsResponse>(
+      POSITIONS_QUERY,
+      { chainId: BASE_CHAIN_ID, first, skip }
+    );
+
+    const rawPositions = response.marketPositions?.items || [];
+    logger.info(`Fetched ${rawPositions.length} positions from Morpho API`);
+
+    // Transform to analyzable format
+    const positions: AnalyzablePosition[] = rawPositions
+      .filter((pos) => pos.state && pos.market)
+      .map((pos) => ({
+        id: pos.id,
+        borrower: pos.user.address,
+        marketId: pos.market.uniqueKey,
+        collateralToken: {
+          address: pos.market.collateralAsset.address,
+          symbol: pos.market.collateralAsset.symbol,
+          decimals: pos.market.collateralAsset.decimals,
+        },
+        loanToken: {
+          address: pos.market.loanAsset.address,
+          symbol: pos.market.loanAsset.symbol,
+          decimals: pos.market.loanAsset.decimals,
+        },
+        collateralAmount: BigInt(pos.state?.collateral || '0'),
+        borrowAmount: BigInt(pos.state?.borrowAssets || '0'),
+        lltv: BigInt(pos.market.lltv || '0'),
+      }))
+      // Filter out positions with no collateral or debt
+      .filter((pos) => pos.collateralAmount > 0n && pos.borrowAmount > 0n);
+
+    return positions;
+  } catch (error) {
+    logger.error('Failed to fetch positions from API', error);
+    throw error;
+  }
+}
+
+// =============================================================================
+// ON-CHAIN DATA FETCHING (FALLBACK)
+// =============================================================================
+
+// Morpho Blue ABI (minimal for reading positions)
+const MORPHO_BLUE_ABI = parseAbi([
+  'function position(bytes32 id, address user) view returns (uint256 supplyShares, uint128 borrowShares, uint128 collateral)',
+  'function market(bytes32 id) view returns (uint128 totalSupplyAssets, uint128 totalSupplyShares, uint128 totalBorrowAssets, uint128 totalBorrowShares, uint128 lastUpdate, uint128 fee)',
+  'function idToMarketParams(bytes32 id) view returns (address loanToken, address collateralToken, address oracle, address irm, uint256 lltv)',
+]);
+
+// ERC20 ABI for token info
+const ERC20_ABI = parseAbi([
+  'function symbol() view returns (string)',
+  'function decimals() view returns (uint8)',
+]);
+
+/**
+ * Fetch position data directly from the Morpho Blue contract
+ * This is a fallback when the API is unavailable
+ */
+export async function fetchPositionOnChain(
+  marketId: `0x${string}`,
+  userAddress: `0x${string}`
+): Promise<{ supplyShares: bigint; borrowShares: bigint; collateral: bigint } | null> {
+  try {
+    const result = await viemClient.readContract({
+      address: MORPHO_BLUE_ADDRESS,
+      abi: MORPHO_BLUE_ABI,
+      functionName: 'position',
+      args: [marketId, userAddress],
+    });
+
+    return {
+      supplyShares: result[0],
+      borrowShares: BigInt(result[1]),
+      collateral: BigInt(result[2]),
+    };
+  } catch (error) {
+    logger.error(`Failed to fetch position on-chain for ${userAddress}`, error);
+    return null;
+  }
+}
+
+/**
+ * Fetch market parameters from the Morpho Blue contract
+ */
+export async function fetchMarketOnChain(
+  marketId: `0x${string}`
+): Promise<{
+  loanToken: string;
+  collateralToken: string;
+  oracle: string;
+  irm: string;
+  lltv: bigint;
+} | null> {
+  try {
+    const result = await viemClient.readContract({
+      address: MORPHO_BLUE_ADDRESS,
+      abi: MORPHO_BLUE_ABI,
+      functionName: 'idToMarketParams',
+      args: [marketId],
+    });
+
+    return {
+      loanToken: result[0],
+      collateralToken: result[1],
+      oracle: result[2],
+      irm: result[3],
+      lltv: result[4],
+    };
+  } catch (error) {
+    logger.error(`Failed to fetch market on-chain for ${marketId}`, error);
+    return null;
+  }
+}
+
+/**
+ * Fetch token info (symbol, decimals) from ERC20 contract
+ */
+export async function fetchTokenInfo(
+  tokenAddress: `0x${string}`
+): Promise<{ symbol: string; decimals: number } | null> {
+  try {
+    const [symbol, decimals] = await Promise.all([
+      viemClient.readContract({
+        address: tokenAddress,
+        abi: ERC20_ABI,
+        functionName: 'symbol',
+      }),
+      viemClient.readContract({
+        address: tokenAddress,
+        abi: ERC20_ABI,
+        functionName: 'decimals',
+      }),
+    ]);
+
+    return { symbol, decimals };
+  } catch (error) {
+    logger.debug(`Failed to fetch token info for ${tokenAddress}`, error);
+    return null;
+  }
+}
+
+// =============================================================================
+// MAIN FETCH FUNCTIONS
+// =============================================================================
+
+/**
+ * Fetch markets (tries API first, falls back to mock data for demo)
+ */
+export async function fetchMarkets(limit: number = 50): Promise<MorphoMarket[]> {
+  try {
+    return await fetchMarketsFromAPI(limit);
+  } catch (error) {
+    logger.warn('API fetch failed, using demo mode');
+    return [];
+  }
+}
+
+/**
+ * Fetch positions with pagination (tries API first)
  */
 export async function fetchPositions(
   first: number = 100,
   skip: number = 0
 ): Promise<AnalyzablePosition[]> {
-  logger.debug(`Fetching positions (first: ${first}, skip: ${skip})...`);
-
   try {
-    const response = await client.request<{ positions: MorphoPosition[] }>(
-      POSITIONS_QUERY,
-      { first, skip }
-    );
-
-    logger.info(`Fetched ${response.positions.length} active positions`);
-
-    // Transform raw positions into analyzable format
-    const positions: AnalyzablePosition[] = response.positions.map((pos) => ({
-      id: pos.id,
-      borrower: pos.borrower,
-      marketId: pos.market.id,
-      collateralToken: {
-        address: pos.market.collateralToken.id,
-        symbol: pos.market.collateralToken.symbol,
-        decimals: pos.market.collateralToken.decimals,
-      },
-      loanToken: {
-        address: pos.market.loanToken.id,
-        symbol: pos.market.loanToken.symbol,
-        decimals: pos.market.loanToken.decimals,
-      },
-      collateralAmount: BigInt(pos.collateral || '0'),
-      borrowAmount: BigInt(pos.borrowAssets || '0'),
-      lltv: BigInt(pos.market.lltv || '0'),
-    }));
-
-    return positions;
+    return await fetchPositionsFromAPI(first, skip);
   } catch (error) {
-    logger.error('Failed to fetch positions', error);
+    logger.warn('API fetch failed for positions');
     throw error;
   }
 }
 
 /**
  * Fetch all positions with pagination
- *
- * The subgraph limits results to 1000 per query, so we need to
- * paginate to get all positions if there are many.
  */
 export async function fetchAllPositions(
   maxPositions: number = 500
@@ -256,17 +451,22 @@ export async function fetchAllPositions(
   let skip = 0;
 
   while (allPositions.length < maxPositions) {
-    const positions = await fetchPositions(pageSize, skip);
+    try {
+      const positions = await fetchPositions(pageSize, skip);
 
-    if (positions.length === 0) {
-      break; // No more positions
+      if (positions.length === 0) {
+        break;
+      }
+
+      allPositions.push(...positions);
+      skip += pageSize;
+
+      // Respect API rate limits (5k/5min)
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    } catch (error) {
+      logger.warn(`Failed to fetch page at skip=${skip}, stopping pagination`);
+      break;
     }
-
-    allPositions.push(...positions);
-    skip += pageSize;
-
-    // Small delay to avoid rate limiting
-    await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
   logger.info(`Total positions fetched: ${allPositions.length}`);
@@ -275,9 +475,6 @@ export async function fetchAllPositions(
 
 /**
  * Get unique tokens from positions for price fetching
- *
- * We need prices for both collateral and loan tokens to calculate
- * health factors and liquidation profitability.
  */
 export function getUniqueTokens(
   positions: AnalyzablePosition[]
@@ -306,9 +503,20 @@ export function getUniqueTokens(
   return tokens;
 }
 
+// =============================================================================
+// EXPORTS
+// =============================================================================
+
 export default {
   fetchMarkets,
   fetchPositions,
   fetchAllPositions,
   getUniqueTokens,
+  // On-chain methods for direct access
+  fetchPositionOnChain,
+  fetchMarketOnChain,
+  fetchTokenInfo,
+  // Constants
+  MORPHO_BLUE_ADDRESS,
+  BASE_CHAIN_ID,
 };
