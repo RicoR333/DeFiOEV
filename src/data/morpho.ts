@@ -85,6 +85,7 @@ export interface MorphoAPIPosition {
   market: {
     uniqueKey: string;
     lltv: string;
+    oracleAddress?: string;
     collateralAsset: {
       address: string;
       symbol: string;
@@ -121,6 +122,10 @@ export interface AnalyzablePosition {
   collateralAmount: bigint;
   borrowAmount: bigint;
   lltv: bigint;
+  // OEV-specific fields
+  oracleAddress?: string;
+  isApi3Oracle?: boolean;
+  isOevEnabled?: boolean;
 }
 
 // =============================================================================
@@ -165,6 +170,7 @@ const MARKETS_QUERY = gql`
 
 /**
  * Query to fetch positions with active borrows on Base
+ * Includes oracle address for OEV detection
  */
 const POSITIONS_QUERY = gql`
   query GetPositionsOnBase($chainId: Int!, $first: Int!, $skip: Int!) {
@@ -186,6 +192,7 @@ const POSITIONS_QUERY = gql`
         market {
           uniqueKey
           lltv
+          oracleAddress
           collateralAsset {
             address
             symbol
@@ -274,7 +281,7 @@ export async function fetchPositionsFromAPI(
     const rawPositions = response.marketPositions?.items || [];
     logger.info(`Fetched ${rawPositions.length} positions from Morpho API`);
 
-    // Transform to analyzable format
+    // Transform to analyzable format with OEV info
     const positions: AnalyzablePosition[] = rawPositions
       .filter((pos) => pos.state && pos.market)
       .map((pos) => ({
@@ -294,6 +301,8 @@ export async function fetchPositionsFromAPI(
         collateralAmount: BigInt(pos.state?.collateral || '0'),
         borrowAmount: BigInt(pos.state?.borrowAssets || '0'),
         lltv: BigInt(pos.market.lltv || '0'),
+        // OEV fields - will be populated by OEV module
+        oracleAddress: pos.market.oracleAddress,
       }))
       // Filter out positions with no collateral or debt
       .filter((pos) => pos.collateralAmount > 0n && pos.borrowAmount > 0n);
